@@ -1,5 +1,10 @@
 """Session management tools for COMSOL MCP Server."""
 
+import atexit
+import os
+import socket
+import subprocess
+import time
 from typing import Optional
 from mcp.server import Server
 from mcp.server.fastmcp import FastMCP
@@ -13,6 +18,7 @@ class SessionManager:
     _client: Optional[mph.Client] = None
     _models: dict[str, mph.Model] = {}
     _current_model: Optional[str] = None
+    _server_process: Optional[subprocess.Popen] = None
     
     def __new__(cls):
         if cls._instance is None:
@@ -25,7 +31,11 @@ class SessionManager:
     
     @property
     def is_connected(self) -> bool:
-        return self._client is not None
+        if self._client is None:
+            return False
+        if self._client.standalone:
+            return True
+        return self._client.port is not None
     
     @property
     def current_model(self) -> Optional[str]:
@@ -64,13 +74,16 @@ class SessionManager:
     
     def connect(self, port: int, host: str = "localhost") -> dict:
         """Connect to a remote COMSOL server."""
-        if self._client is not None:
+        if self.is_connected:
             return {
                 "success": False,
                 "error": "COMSOL session already running. Disconnect first."
             }
         try:
-            self._client = mph.Client(port=port, host=host)
+            if self._client is None:
+                self._client = mph.Client(port=port, host=host)
+            else:
+                self._client.connect(port, host)
             return {
                 "success": True,
                 "version": self._client.version,
@@ -79,27 +92,169 @@ class SessionManager:
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
-    
-    def disconnect(self) -> dict:
-        """Disconnect and clear the session."""
-        if self._client is None:
-            return {"success": True, "message": "No active session."}
+
+    def start_server_and_connect(
+        self,
+        port: int = 2036,
+        host: str = "127.0.0.1",
+        comsol_path: Optional[str] = None,
+        timeout: float = 45.0,
+    ) -> dict:
+        """Start a local COMSOL mphserver process and connect to it."""
+        if self.is_connected:
+            return {
+                "success": True,
+                "message": "COMSOL client is already connected.",
+                "version": self._client.version,
+                "host": self._client.host,
+                "port": self._client.port,
+            }
+
+        comsol_bin = (
+            comsol_path
+            or os.environ.get("COMSOL_BIN")
+            or "/Applications/COMSOL62/Multiphysics/bin/comsol"
+        )
+
+        if not os.path.exists(comsol_bin):
+            return {"success": False, "error": f"COMSOL executable not found: {comsol_bin}"}
+
+        def port_open() -> bool:
+            try:
+                with socket.create_connection((host, port), timeout=1.0):
+                    return True
+            except OSError:
+                return False
+
+        started_process = False
+        if not port_open():
+            command = [
+                comsol_bin,
+                "mphserver",
+                "-port",
+                str(port),
+                "-login",
+                "auto",
+                "-multi",
+                "on",
+                "-silent",
+            ]
+            env = os.environ.copy()
+            env.setdefault("PATH", f"{os.path.dirname(comsol_bin)}:{env.get('PATH', '')}")
+            self._server_process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+            started_process = True
+
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if self._server_process.poll() is not None:
+                    output = ""
+                    if self._server_process.stdout is not None:
+                        output = self._server_process.stdout.read() or ""
+                    return {
+                        "success": False,
+                        "error": "COMSOL mphserver exited before accepting connections.",
+                        "command": command,
+                        "output": output[-2000:],
+                    }
+                if port_open():
+                    break
+                time.sleep(0.5)
+
+            if not port_open():
+                return {
+                    "success": False,
+                    "error": f"Timed out waiting for COMSOL mphserver on {host}:{port}.",
+                    "command": command,
+                }
+
         try:
-            self._client.clear()
+            if self._client is None:
+                self._client = mph.Client(port=port, host=host)
+            else:
+                self._client.connect(port, host)
+            return {
+                "success": True,
+                "version": self._client.version,
+                "port": port,
+                "host": host,
+                "server_started": started_process,
+                "server_pid": self._server_process.pid if self._server_process is not None else None,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e), "server_started": started_process}
+
+    def stop_server(self, timeout: float = 10.0) -> dict:
+        """Terminate the COMSOL mphserver process started by this MCP server."""
+        if self._server_process is None:
+            return {"success": True, "server_stopped": False, "message": "No MCP-started COMSOL server process is tracked."}
+
+        process = self._server_process
+        if process.poll() is not None:
+            self._server_process = None
+            return {"success": True, "server_stopped": False, "message": "Tracked COMSOL server process had already exited."}
+
+        process.terminate()
+        try:
+            process.wait(timeout=timeout)
+            self._server_process = None
+            return {"success": True, "server_stopped": True, "pid": process.pid}
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=timeout)
+            self._server_process = None
+            return {"success": True, "server_stopped": True, "pid": process.pid, "forced": True}
+    
+    def disconnect(self, stop_server: bool = True) -> dict:
+        """Disconnect and clear the session."""
+        server_result = None
+        try:
+            if self._client is not None:
+                self._client.clear()
+                if not self._client.standalone and self._client.port is not None:
+                    self._client.disconnect()
             self._models.clear()
             self._current_model = None
-            return {"success": True, "message": "Session cleared (models removed, client kept alive for reuse)."}
+
+            if stop_server:
+                server_result = self.stop_server()
+
+            return {
+                "success": True,
+                "message": "Session cleared; client disconnected; MCP-started server stopped if present.",
+                "server": server_result,
+            }
         except Exception as e:
             self._models.clear()
             self._current_model = None
-            return {"success": True, "message": f"Session cleared (error during clear: {e})"}
+            if stop_server:
+                server_result = self.stop_server()
+            return {
+                "success": True,
+                "message": f"Session cleared (error during client cleanup: {e})",
+                "server": server_result,
+            }
+
+    def shutdown(self) -> None:
+        """Best-effort cleanup for interpreter shutdown."""
+        try:
+            self.disconnect(stop_server=True)
+        except Exception:
+            pass
     
     def get_status(self) -> dict:
         """Get current session status."""
-        if self._client is None:
+        if not self.is_connected:
             return {
                 "connected": False,
-                "message": "No active COMSOL session."
+                "message": "No active COMSOL session.",
+                "server_tracked": self._server_process is not None and self._server_process.poll() is None,
             }
         
         model_list = []
@@ -155,6 +310,7 @@ class SessionManager:
 
 
 session_manager = SessionManager()
+atexit.register(session_manager.shutdown)
 
 
 def register_session_tools(mcp: FastMCP) -> None:
@@ -187,16 +343,60 @@ def register_session_tools(mcp: FastMCP) -> None:
             Connection info or error message
         """
         return session_manager.connect(port=port, host=host)
+
+    @mcp.tool()
+    def comsol_start_server(
+        port: int = 2036,
+        host: str = "127.0.0.1",
+        comsol_path: Optional[str] = None,
+        timeout: float = 45.0,
+    ) -> dict:
+        """
+        Start a local COMSOL mphserver process and connect to it.
+
+        This uses `comsol mphserver -login auto -multi on -silent`, so COMSOL
+        must already have local server login information stored in the user's
+        COMSOL preferences.
+
+        Args:
+            port: Server port to use
+            host: Host/IP to connect to after starting the server
+            comsol_path: Full path to the COMSOL launcher (default: COMSOL_BIN env or COMSOL 6.2 path)
+            timeout: Seconds to wait for the server port to become available
+
+        Returns:
+            Connection status and server process information
+        """
+        return session_manager.start_server_and_connect(
+            port=port,
+            host=host,
+            comsol_path=comsol_path,
+            timeout=timeout,
+        )
     
     @mcp.tool()
     def comsol_disconnect() -> dict:
         """
-        Disconnect from COMSOL and clear all models from memory.
+        Disconnect from COMSOL, clear all models from memory, and stop any
+        COMSOL server process started by this MCP server.
         
         Returns:
             Success status and message
         """
-        return session_manager.disconnect()
+        return session_manager.disconnect(stop_server=True)
+
+    @mcp.tool()
+    def comsol_stop_server(timeout: float = 10.0) -> dict:
+        """
+        Stop the COMSOL mphserver process started by this MCP server.
+
+        Args:
+            timeout: Seconds to wait before force-killing the server process
+
+        Returns:
+            Stop status
+        """
+        return session_manager.stop_server(timeout=timeout)
     
     @mcp.tool()
     def comsol_status() -> dict:

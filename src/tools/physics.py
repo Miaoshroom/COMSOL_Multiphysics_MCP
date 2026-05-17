@@ -259,25 +259,157 @@ def register_physics_tools(mcp: FastMCP) -> None:
             }
         
         try:
-            physics_node = model.create("physics", "HeatTransfer")
-            
+            components = model.java.component()
+            if components.size() == 0:
+                return {"success": False, "error": "No component found. Create a component first."}
+
+            comp = components.get(0)
+            geometries = comp.geom()
+            if geometries.size() == 0:
+                return {"success": False, "error": "No geometry found. Create and build a geometry first."}
+
+            geom = geometries.get(0)
+            physics_node = comp.physics().create("ht", "HeatTransfer", geom.tag())
+
             if domain_selection:
                 try:
-                    physics_node.property("selection", domain_selection)
+                    physics_node.selection().named(domain_selection)
                 except Exception:
                     pass
             
             return {
                 "success": True,
                 "physics": {
-                    "name": physics_node.name() if hasattr(physics_node, 'name') else "Heat Transfer",
+                    "name": physics_node.label() if hasattr(physics_node, 'label') else "Heat Transfer",
                     "type": "HeatTransfer",
-                    "tag": "ht",
+                    "tag": physics_node.tag(),
                     "domain_selection": domain_selection,
                 }
             }
         except Exception as e:
             return {"success": False, "error": f"Failed to add Heat Transfer: {str(e)}"}
+
+    @mcp.tool()
+    def heat_transfer_cube_test(
+        model_name: str = "minimal_3d_heat_transfer_test",
+        size: str = "1[mm]",
+        thermal_conductivity: str = "1[W/(m*K)]",
+        bottom_temperature: str = "293.15[K]",
+        top_heat_flux: str = "1000[W/m^2]",
+    ) -> dict:
+        """
+        Create and solve a minimal 3D Heat Transfer test model.
+
+        The model is a cube with fixed temperature on the bottom face and
+        inward heat flux on the top face. It returns the minimum and maximum
+        temperature from a stationary solution.
+
+        Args:
+            model_name: Name for the new model
+            size: Cube side length
+            thermal_conductivity: Isotropic material thermal conductivity
+            bottom_temperature: Fixed temperature on z=0 boundary
+            top_heat_flux: Inward heat flux on z=max boundary
+
+        Returns:
+            Build and solve status with min/max temperature
+        """
+        if not session_manager.is_connected:
+            return {"success": False, "error": "No active COMSOL session. Start with comsol_start or comsol_connect first."}
+
+        client = session_manager.client
+        if client is None:
+            return {"success": False, "error": "Client not available."}
+
+        steps = []
+
+        try:
+            model = client.create(model_name)
+            tracked_name = session_manager.add_model(model)
+            session_manager.set_current_model(tracked_name)
+            steps.append({"tool": "heat_transfer_cube_test", "action": f"Created model '{tracked_name}'"})
+
+            jm = model.java
+            comp = jm.component().create("comp1", True)
+            steps.append({"tool": "heat_transfer_cube_test", "action": "Created component comp1"})
+
+            geom = comp.geom().create("geom1", 3)
+            block = geom.create("blk1", "Block")
+            block.set("size", [size, size, size])
+            geom.run()
+            steps.append({"tool": "heat_transfer_cube_test", "action": f"Created and built 3D block with side length {size}"})
+
+            material = comp.material().create("mat1", "Common")
+            material.label("Unit thermal conductivity material")
+            material.selection().all()
+            material.propertyGroup("def").set("thermalconductivity", thermal_conductivity)
+            steps.append({"tool": "heat_transfer_cube_test", "action": f"Created material with k = {thermal_conductivity}"})
+
+            heat = comp.physics().create("ht", "HeatTransfer", "geom1")
+            steps.append({"tool": "heat_transfer_cube_test", "action": "Added Heat Transfer physics interface ht"})
+
+            bottom_boundary = 3
+            top_boundary = 4
+
+            temperature = heat.feature().create("temp1", "TemperatureBoundary", 2)
+            temperature.selection().set([bottom_boundary])
+            temperature.set("T0", bottom_temperature)
+
+            heat_flux = heat.feature().create("hf1", "HeatFluxBoundary", 2)
+            heat_flux.selection().set([top_boundary])
+            heat_flux.set("q0", top_heat_flux)
+            steps.append({
+                "tool": "heat_transfer_cube_test",
+                "action": f"Set bottom boundary {bottom_boundary} to {bottom_temperature} and top boundary {top_boundary} heat flux to {top_heat_flux}",
+            })
+
+            maxop = comp.cpl().create("maxop1", "Maximum")
+            maxop.selection().geom("geom1", 3)
+            maxop.selection().all()
+
+            minop = comp.cpl().create("minop1", "Minimum")
+            minop.selection().geom("geom1", 3)
+            minop.selection().all()
+            steps.append({"tool": "heat_transfer_cube_test", "action": "Created domain maximum and minimum operators"})
+
+            mesh = comp.mesh().create("mesh1")
+            mesh.autoMeshSize(5)
+            mesh.run()
+            steps.append({"tool": "heat_transfer_cube_test", "action": "Generated automatic mesh"})
+
+            study = jm.study().create("std1")
+            study.create("stat", "Stationary")
+            study.run()
+            steps.append({"tool": "heat_transfer_cube_test", "action": "Created and solved stationary study std1"})
+
+            max_temperature = float(model.evaluate("maxop1(T)"))
+            min_temperature = float(model.evaluate("minop1(T)"))
+            steps.append({"tool": "heat_transfer_cube_test", "action": "Evaluated maximum and minimum temperature"})
+
+            return {
+                "success": True,
+                "model": tracked_name,
+                "parameters": {
+                    "size": size,
+                    "thermal_conductivity": thermal_conductivity,
+                    "bottom_temperature": bottom_temperature,
+                    "top_heat_flux": top_heat_flux,
+                    "bottom_boundary": bottom_boundary,
+                    "top_boundary": top_boundary,
+                },
+                "temperature": {
+                    "minimum": min_temperature,
+                    "maximum": max_temperature,
+                    "unit": "K",
+                },
+                "steps": steps,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Failed to create or solve heat transfer cube test: {str(e)}",
+                "steps": steps,
+            }
     
     @mcp.tool()
     def physics_add_laminar_flow(
@@ -1066,5 +1198,4 @@ def register_physics_tools(mcp: FastMCP) -> None:
             }
         except Exception as e:
             return {"success": False, "error": f"Failed to create boundary condition: {str(e)}"}
-
 
