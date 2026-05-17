@@ -1,0 +1,22 @@
+
+# Local environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Local knowledge base
+knowledge_base/
+knowledge_base.bak/
+
+# Local run scripts
+*.command
+run.command
+
+# COMSOL models / local outputs
+*.mph
+comsol_models/
