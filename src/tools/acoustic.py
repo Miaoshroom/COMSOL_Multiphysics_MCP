@@ -347,7 +347,7 @@ def register_acoustic_tools(mcp: FastMCP) -> None:
             model_name: Model name (default: current model)
             output_dir: Output directory (default: loaded model directory)
             export_data: Whether to run data1 export
-            export_plot: Whether to run the template absorption-curve export
+            export_plot: Whether to export the template absorption curve as text and PNG
             save_model: Whether to save the working model
 
         Returns:
@@ -362,6 +362,7 @@ def register_acoustic_tools(mcp: FastMCP) -> None:
             stem = Path(model.file()).stem if model.file() else model.name()
             data_path = base_dir / f"{stem}_data1.txt"
             curve_path = base_dir / f"{stem}_absorption_curve.txt"
+            image_path = base_dir / f"{stem}_absorption_curve.png"
 
             jm.component("comp1").mesh("mesh1").run()
             jm.study("std1").run()
@@ -374,6 +375,20 @@ def register_acoustic_tools(mcp: FastMCP) -> None:
             if export_plot:
                 model.export("绘图 4", str(curve_path))
                 exported["absorption_curve"] = str(curve_path)
+
+                image_tag = "img_absorption_curve"
+                exports = jm.result().export()
+                try:
+                    exports.remove(image_tag)
+                except Exception:
+                    pass
+                image = exports.create(image_tag, "Image")
+                image.set("sourceobject", "pg7")
+                image.set("pngfilename", str(image_path))
+                image.set("width", "1000")
+                image.set("height", "700")
+                image.run()
+                exported["absorption_curve_png"] = str(image_path)
 
             if save_model:
                 model.save()
