@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 def setup_mirror():
     """Setup HuggingFace mirror for users in China."""
-    hf_mirror = "https://hf-mirror.com"
+    hf_mirror = "https://huggingface.co"
     if "HF_ENDPOINT" not in os.environ:
         os.environ["HF_ENDPOINT"] = hf_mirror
         print(f"[INFO] Using HuggingFace mirror: {hf_mirror}")

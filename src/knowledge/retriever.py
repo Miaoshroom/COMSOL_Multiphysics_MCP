@@ -15,7 +15,7 @@ DEFAULT_PDF_DIR = Path(__file__).parent.parent.parent / "pdf"
 DEFAULT_DB_DIR = Path(__file__).parent.parent.parent / "knowledge_base"
 
 # Embedding model - use HF mirror for China if needed
-HF_MIRROR = "https://hf-mirror.com"
+HF_MIRROR = "https://huggingface.co"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Fast, good quality
 
 # Local model cache path for offline use
