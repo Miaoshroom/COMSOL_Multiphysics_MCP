@@ -381,8 +381,8 @@ def register_acoustic_tools(mcp: FastMCP) -> None:
         - aveop1 selects the interface between the two added upper blocks.
         - pml1 selects the top added block.
         - Background Pressure Field selects the lower of the two added upper blocks.
-        - Thermoviscous Boundary Layer Impedance selects the sample/lower-air walls,
-          excluding the two added upper blocks and their interface/opening faces.
+        - Thermoviscous Boundary Layer Impedance starts from all boundaries, then
+          removes the boundaries belonging to the two added upper blocks.
 
         Args:
             model_name: Model name (default: current model)
@@ -422,6 +422,20 @@ def register_acoustic_tools(mcp: FastMCP) -> None:
 
             warnings = []
             feature_tags = set(geom.feature().tags())
+            all_boundaries = _box_entities(
+                comp,
+                "auto_all_boundaries",
+                2,
+                (x0 - 0.1, x1 + 0.1, y0 - 0.1, y1 + 0.1, z0 - 0.1, z_air_top + 2 * h + 0.1),
+                "intersects",
+            )
+            upper_stack_boundaries = _box_entities(
+                comp,
+                "auto_upper_stack_boundaries",
+                2,
+                (x0 - 0.1, x1 + 0.1, y0 - 0.1, y1 + 0.1, z_air_top, z_air_top + 2 * h),
+                "inside",
+            )
             lower_boundary_candidates = _box_entities(
                 comp,
                 "auto_lower_internal_boundaries",
@@ -430,17 +444,16 @@ def register_acoustic_tools(mcp: FastMCP) -> None:
                 "intersects",
             )
 
-            thermoviscous = [value for value in lower_boundary_candidates if value not in set(integration + average)]
+            thermoviscous = [value for value in all_boundaries if value not in set(upper_stack_boundaries)]
 
-            # The generated 50 mm shell-with-top-hole geometry has two extra
-            # opening/interface faces near the hole that COMSOL reports in the
-            # lower internal Box selection, but they are not valid wall faces.
-            # Keep the exact corrected wall set for this known geometry.
             if {"obj_outer", "obj_inner", "obj_hole", "solid_shell", "blk2", "blk3"}.issubset(feature_tags):
-                known_shell_walls = [10, 11, 12, 13, 14, 15, 16, 20]
-                if set(known_shell_walls).issubset(set(lower_boundary_candidates)):
-                    thermoviscous = known_shell_walls
-                else:
+                # In this validated shell-with-hole workflow, faces 18 and 19 are
+                # opening/contact remnants near the top hole. The GUI marks them
+                # as not applicable for this wall condition, so remove them after
+                # applying the "select all, then remove upper stack" rule.
+                not_applicable = {18, 19}
+                thermoviscous = [value for value in thermoviscous if value not in not_applicable]
+                if thermoviscous != [10, 11, 12, 13, 14, 15, 16, 20]:
                     warnings.append(
                         "Detected shell-with-hole geometry, but boundary numbering differed from the validated 50 mm test."
                     )
@@ -479,6 +492,8 @@ def register_acoustic_tools(mcp: FastMCP) -> None:
                     "free_tet_domains": free_tet_domains,
                     "sweep_domains": pml_domains,
                     "lower_domain_candidates": lower_domains,
+                    "all_boundaries": all_boundaries,
+                    "upper_stack_boundaries_removed": upper_stack_boundaries,
                     "lower_internal_boundary_candidates": lower_boundary_candidates,
                 },
                 "selections": selection_results,
