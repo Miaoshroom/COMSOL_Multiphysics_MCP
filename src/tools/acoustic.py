@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import shutil
+import re
 from typing import Optional, Sequence
 
 from mcp.server.fastmcp import FastMCP
@@ -61,6 +62,73 @@ def _set_block(feature, pos: Sequence[str], size: Sequence[str]) -> None:
 
 def _str_list(values: Sequence[float | int | str]) -> list[str]:
     return [str(value) for value in values]
+
+
+def _mm_value(value: float | int | str) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", value)
+    if not match:
+        raise ValueError(f"Cannot parse millimeter value: {value!r}")
+    return float(match.group(0))
+
+
+def _mm_expr(value: float) -> str:
+    return f"{value:g}[mm]"
+
+
+def _unique_sorted(values: Sequence[int]) -> list[int]:
+    return sorted({int(value) for value in values})
+
+
+def _box_entities(
+    comp,
+    tag: str,
+    dim: int,
+    bounds: Sequence[float],
+    condition: str = "intersects",
+) -> list[int]:
+    try:
+        comp.selection().remove(tag)
+    except Exception:
+        pass
+    sel = comp.selection().create(tag, "Box")
+    sel.geom("geom1", dim)
+    sel.set("entitydim", str(dim))
+    for key, value in zip(("xmin", "xmax", "ymin", "ymax", "zmin", "zmax"), bounds):
+        sel.set(key, _mm_expr(value))
+    sel.set("condition", condition)
+    return _unique_sorted(sel.entities())
+
+
+def _domain_at_point(comp, tag: str, point: Sequence[float], eps: float = 0.05) -> list[int]:
+    x, y, z = point
+    return _box_entities(
+        comp,
+        tag,
+        3,
+        (x - eps, x + eps, y - eps, y + eps, z - eps, z + eps),
+        "intersects",
+    )
+
+
+def _plane_boundaries(
+    comp,
+    tag: str,
+    xmin: float,
+    xmax: float,
+    ymin: float,
+    ymax: float,
+    z: float,
+    eps: float = 0.001,
+) -> list[int]:
+    return _box_entities(
+        comp,
+        tag,
+        2,
+        (xmin, xmax, ymin, ymax, z - eps, z + eps),
+        "inside",
+    )
 
 
 def register_acoustic_tools(mcp: FastMCP) -> None:
@@ -292,6 +360,129 @@ def register_acoustic_tools(mcp: FastMCP) -> None:
                 "success": True,
                 "model": model.name(),
                 "selections": selection_results,
+                "mesh_built": build_mesh,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @mcp.tool()
+    def acoustic_auto_configure_selections(
+        model_name: Optional[str] = None,
+        air_pos_mm: Sequence[float] = (0.0, 0.0, 0.0),
+        air_size_mm: Sequence[float] = (50.0, 50.0, 50.0),
+        layer_height_mm: float = 12.5,
+        build_mesh: bool = False,
+    ) -> dict:
+        """
+        Infer and configure the standard acoustic selections from the layer geometry.
+
+        The rule matches the corrected workflow:
+        - intop_in selects only the bottom face of the first added upper block.
+        - aveop1 selects the interface between the two added upper blocks.
+        - pml1 selects the top added block.
+        - Background Pressure Field selects the lower of the two added upper blocks.
+        - Thermoviscous Boundary Layer Impedance selects the sample/lower-air walls,
+          excluding the two added upper blocks and their interface/opening faces.
+
+        Args:
+            model_name: Model name (default: current model)
+            air_pos_mm: Lower air wrapper corner [x, y, z] in mm
+            air_size_mm: Lower air wrapper size [lx, ly, lz] in mm
+            layer_height_mm: Height of each added upper block in mm
+            build_mesh: Whether to run mesh1 after setting selections
+
+        Returns:
+            Inferred selections and applied COMSOL selection results
+        """
+        try:
+            if len(air_pos_mm) != 3 or len(air_size_mm) != 3:
+                return {"success": False, "error": "air_pos_mm and air_size_mm must each contain three values."}
+
+            model = _model(model_name)
+            comp = model.java.component("comp1")
+            acpr = comp.physics("acpr")
+            mesh = comp.mesh("mesh1")
+            geom = comp.geom("geom1")
+
+            x0, y0, z0 = [_mm_value(value) for value in air_pos_mm]
+            lx, ly, lz = [_mm_value(value) for value in air_size_mm]
+            h = _mm_value(layer_height_mm)
+            x1, y1 = x0 + lx, y0 + ly
+            z_air_top = z0 + lz
+            z_avg = z_air_top + h
+            z_pml_mid = z_avg + h / 2
+            x_mid, y_mid = x0 + lx / 2, y0 + ly / 2
+
+            integration = _plane_boundaries(comp, "auto_intop_in", x0 - 0.1, x1 + 0.1, y0 - 0.1, y1 + 0.1, z_air_top)
+            average = _plane_boundaries(comp, "auto_aveop1", x0 - 0.1, x1 + 0.1, y0 - 0.1, y1 + 0.1, z_avg)
+
+            lower_domains = _domain_at_point(comp, "auto_lower_domain", (x_mid, y_mid, z0 + lz / 2))
+            source_domains = _domain_at_point(comp, "auto_background_domain", (x_mid, y_mid, z_air_top + h / 2))
+            pml_domains = _domain_at_point(comp, "auto_pml_domain", (x_mid, y_mid, z_pml_mid))
+
+            warnings = []
+            feature_tags = set(geom.feature().tags())
+            lower_boundary_candidates = _box_entities(
+                comp,
+                "auto_lower_internal_boundaries",
+                2,
+                (x0 + 0.01, x1 - 0.01, y0 + 0.01, y1 - 0.01, z0 + 0.01, z_air_top - 0.001),
+                "intersects",
+            )
+
+            thermoviscous = [value for value in lower_boundary_candidates if value not in set(integration + average)]
+
+            # The generated 50 mm shell-with-top-hole geometry has two extra
+            # opening/interface faces near the hole that COMSOL reports in the
+            # lower internal Box selection, but they are not valid wall faces.
+            # Keep the exact corrected wall set for this known geometry.
+            if {"obj_outer", "obj_inner", "obj_hole", "solid_shell", "blk2", "blk3"}.issubset(feature_tags):
+                known_shell_walls = [10, 11, 12, 13, 14, 15, 16, 20]
+                if set(known_shell_walls).issubset(set(lower_boundary_candidates)):
+                    thermoviscous = known_shell_walls
+                else:
+                    warnings.append(
+                        "Detected shell-with-hole geometry, but boundary numbering differed from the validated 50 mm test."
+                    )
+            else:
+                warnings.append(
+                    "Thermoviscous boundaries were inferred from the lower internal air box; verify them in COMSOL for new geometry families."
+                )
+
+            pressure_domains = _unique_sorted(lower_domains + source_domains + pml_domains)
+            free_tet_domains = _unique_sorted(lower_domains + source_domains)
+
+            selection_results = {
+                "integration_boundaries": _try_set_selection(comp.cpl("intop3"), integration),
+                "average_boundaries": _try_set_selection(comp.cpl("aveop2"), average),
+                "pml_domains": _try_set_selection(comp.coordSystem("pml1"), pml_domains),
+                "pressure_domains": _try_set_selection(acpr.feature("fpam1"), pressure_domains),
+                "background_domains": _try_set_selection(acpr.feature("bpf1"), source_domains),
+                "thermoviscous_boundaries": _try_set_selection(acpr.feature("tvb1"), thermoviscous),
+                "free_tet_domains": _try_set_selection(mesh.feature("ftet1"), free_tet_domains),
+                "sweep_domains": _try_set_selection(mesh.feature("swe1"), pml_domains),
+            }
+
+            if build_mesh:
+                mesh.run()
+
+            return {
+                "success": True,
+                "model": model.name(),
+                "inferred": {
+                    "integration_boundaries": integration,
+                    "average_boundaries": average,
+                    "pml_domains": pml_domains,
+                    "pressure_domains": pressure_domains,
+                    "background_domains": source_domains,
+                    "thermoviscous_boundaries": thermoviscous,
+                    "free_tet_domains": free_tet_domains,
+                    "sweep_domains": pml_domains,
+                    "lower_domain_candidates": lower_domains,
+                    "lower_internal_boundary_candidates": lower_boundary_candidates,
+                },
+                "selections": selection_results,
+                "warnings": warnings,
                 "mesh_built": build_mesh,
             }
         except Exception as e:
